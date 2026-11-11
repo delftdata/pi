@@ -45,4 +45,5 @@ plans/
 .pi/hf-sessions-backup/
 .pi/settings.json
 collect.sh
+results/
 packages/agent/docs/extensions/pi-server-artifact/index.md

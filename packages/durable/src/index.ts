@@ -18,6 +18,16 @@ export {
 	StorageRequestError,
 } from "./errors.ts";
 export {
+	type ConflictReport,
+	computeHash,
+	type ExecuteFootprintItem,
+	FootprintTracker,
+	type ReadFootprintItem,
+	type StateFootprint,
+	TrackingExecutionEnv,
+	type WriteFootprintItem,
+} from "./footprint/index.ts";
+export {
 	AgentDoc,
 	configure,
 	DEFAULT_COMPACTION_POLICY,

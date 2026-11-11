@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "id": "slugify-cleaner",
+      "name": "Slugify Consecutive Spaces & Special Chars",
+      "problem": "Fix slugify.py so that multiple consecutive spaces and non-alphanumeric characters are collapsed into a single dash, and leading/trailing dashes are stripped.\nRun 'python3 test_slugify.py' using bash to verify all tests pass.",
+      "testCmd": "python3 test_slugify.py",
+      "files": {
+        "slugify.py": "import re\n\ndef slugify(text: str) -> str:\n    \"\"\"\n    Convert a string into a clean URL-friendly slug.\n    Bug: Multiple consecutive spaces/punctuation produce repeated dashes.\n    Example: 'hello   world' -> 'hello---world' instead of 'hello-world'\n    \"\"\"\n    # BUGGY IMPLEMENTATION:\n    cleaned = text.strip().replace(\" \", \"-\").lower()\n    return cleaned\n",
+        "test_slugify.py": "import unittest\nfrom slugify import slugify\n\nclass TestSlugify(unittest.TestCase):\n    def test_single_space(self):\n        self.assertEqual(slugify(\"hello world\"), \"hello-world\")\n\n    def test_multiple_spaces(self):\n        self.assertEqual(slugify(\"hello   world\"), \"hello-world\")\n\n    def test_special_characters(self):\n        self.assertEqual(slugify(\"hello!  world?\"), \"hello-world\")\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      }
+    },
+    {
+      "id": "palindrome-validator",
+      "name": "Palindrome Validator Ignoring Punctuation and Case",
+      "problem": "Fix palindrome.py so that is_palindrome(s) ignores case, whitespace, and punctuation, returning True for valid palindromes like 'A man, a plan, a canal: Panama!' and False for non-palindromes. An empty string should return True.\nRun 'python3 test_palindrome.py' using bash to verify all tests pass.",
+      "testCmd": "python3 test_palindrome.py",
+      "files": {
+        "palindrome.py": "def is_palindrome(s: str) -> bool:\n    \"\"\"\n    Check if a string is a palindrome, ignoring non-alphanumeric characters and casing.\n    Bug: Fails to ignore punctuation, spaces, and casing.\n    \"\"\"\n    # BUGGY IMPLEMENTATION:\n    return s == s[::-1]\n",
+        "test_palindrome.py": "import unittest\nfrom palindrome import is_palindrome\n\nclass TestPalindrome(unittest.TestCase):\n    def test_simple_true(self):\n        self.assertTrue(is_palindrome(\"racecar\"))\n\n    def test_phrase(self):\n        self.assertTrue(is_palindrome(\"A man, a plan, a canal: Panama!\"))\n\n    def test_simple_false(self):\n        self.assertFalse(is_palindrome(\"hello\"))\n\n    def test_empty(self):\n        self.assertTrue(is_palindrome(\"\"))\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      }
+    }
+  ]
+}
+
