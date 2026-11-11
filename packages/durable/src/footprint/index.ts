@@ -7,6 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { relative, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord/context";
 import type {
 	BinaryReader,
@@ -95,6 +96,45 @@ export interface ConflictReport {
 	hasConflicts: boolean;
 	readWriteConflicts: Array<{ taskA: string; taskB: string; resource: string }>;
 	writeWriteConflicts: Array<{ taskA: string; taskB: string; resource: string }>;
+}
+
+export interface PredictedSubtask {
+	id: string;
+	name: string;
+	predictedRead: string[];
+	predictedWrite: string[];
+	predictedExecute: string[];
+}
+
+export interface PredictedFootprint {
+	read: string[];
+	write: string[];
+	execute: string[];
+	subtasks?: PredictedSubtask[];
+	reasoning?: string;
+}
+
+export interface ResourceSetComparison {
+	predicted: string[];
+	actual: string[];
+	truePositives: string[];
+	falsePositives: string[];
+	falseNegatives: string[];
+	precision: number;
+	recall: number;
+	f1: number;
+}
+
+export interface FootprintComparisonReport {
+	read: ResourceSetComparison;
+	write: ResourceSetComparison;
+	execute: ResourceSetComparison;
+	summary: {
+		overallPrecision: number;
+		overallRecall: number;
+		overallF1: number;
+		exactMatch: boolean;
+	};
 }
 
 export function computeHash(content: string | Uint8Array): string {
@@ -380,6 +420,105 @@ export class FootprintTracker {
 			writeWriteConflicts,
 		};
 	}
+
+	static compareFootprints(
+		predicted: PredictedFootprint,
+		actual: StateFootprint,
+		basePath?: string,
+	): FootprintComparisonReport {
+		const normalizePath = (p: string): string => {
+			let clean = p.replace(/^file:/, "");
+			if (basePath) {
+				const resolvedBase = resolve(basePath);
+				const resolvedP = resolve(basePath, clean);
+				clean = relative(resolvedBase, resolvedP);
+			}
+			return clean.replace(/^\.\//, "");
+		};
+
+		const actualReads = Array.from(new Set(actual.readSet.map((r) => normalizePath(r.path ?? r.resource))));
+		const actualWrites = Array.from(new Set(actual.writeSet.map((w) => normalizePath(w.path ?? w.resource))));
+		const actualExecutes = Array.from(new Set(actual.executeSet.map((e) => e.command.trim())));
+
+		const predictedReads = predicted.read.map(normalizePath);
+		const predictedWrites = predicted.write.map(normalizePath);
+		const predictedExecutes = predicted.execute.map((c) => c.trim());
+
+		const readComp = compareResourceSets(predictedReads, actualReads);
+		const writeComp = compareResourceSets(predictedWrites, actualWrites);
+		const execComp = compareResourceSets(predictedExecutes, actualExecutes);
+
+		const totalPred = readComp.predicted.length + writeComp.predicted.length + execComp.predicted.length;
+		const totalAct = readComp.actual.length + writeComp.actual.length + execComp.actual.length;
+		const totalTP = readComp.truePositives.length + writeComp.truePositives.length + execComp.truePositives.length;
+
+		const overallPrecision = totalPred === 0 && totalAct === 0 ? 1 : totalPred === 0 ? 0 : totalTP / totalPred;
+		const overallRecall = totalPred === 0 && totalAct === 0 ? 1 : totalAct === 0 ? 0 : totalTP / totalAct;
+		const overallF1 =
+			overallPrecision + overallRecall === 0
+				? 0
+				: (2 * overallPrecision * overallRecall) / (overallPrecision + overallRecall);
+
+		const exactMatch =
+			readComp.falsePositives.length === 0 &&
+			readComp.falseNegatives.length === 0 &&
+			writeComp.falsePositives.length === 0 &&
+			writeComp.falseNegatives.length === 0 &&
+			execComp.falsePositives.length === 0 &&
+			execComp.falseNegatives.length === 0;
+
+		return {
+			read: readComp,
+			write: writeComp,
+			execute: execComp,
+			summary: {
+				overallPrecision: Number(overallPrecision.toFixed(3)),
+				overallRecall: Number(overallRecall.toFixed(3)),
+				overallF1: Number(overallF1.toFixed(3)),
+				exactMatch,
+			},
+		};
+	}
+}
+
+function compareResourceSets(predicted: string[], actual: string[]): ResourceSetComparison {
+	const predSet = new Set(predicted.map((s) => s.trim()).filter(Boolean));
+	const actSet = new Set(actual.map((s) => s.trim()).filter(Boolean));
+
+	const truePositives: string[] = [];
+	const falsePositives: string[] = [];
+	const falseNegatives: string[] = [];
+
+	for (const item of predSet) {
+		if (actSet.has(item)) {
+			truePositives.push(item);
+		} else {
+			falsePositives.push(item);
+		}
+	}
+
+	for (const item of actSet) {
+		if (!predSet.has(item)) {
+			falseNegatives.push(item);
+		}
+	}
+
+	const precision =
+		predSet.size === 0 && actSet.size === 0 ? 1 : predSet.size === 0 ? 0 : truePositives.length / predSet.size;
+	const recall =
+		predSet.size === 0 && actSet.size === 0 ? 1 : actSet.size === 0 ? 0 : truePositives.length / actSet.size;
+	const f1 = precision + recall === 0 ? 0 : (2 * precision * recall) / (precision + recall);
+
+	return {
+		predicted: Array.from(predSet),
+		actual: Array.from(actSet),
+		truePositives,
+		falsePositives,
+		falseNegatives,
+		precision: Number(precision.toFixed(3)),
+		recall: Number(recall.toFixed(3)),
+		f1: Number(f1.toFixed(3)),
+	};
 }
 
 /**

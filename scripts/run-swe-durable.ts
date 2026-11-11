@@ -28,8 +28,10 @@ import {
 	createRegistry,
 	defineExtension,
 	FootprintTracker,
+	type FootprintComparisonReport,
 	Harness,
 	LiveDoc,
+	type PredictedFootprint,
 	section,
 	ToolResultEntry,
 	TrackingExecutionEnv,
@@ -81,13 +83,24 @@ function estimateMessagesTokens(messages: readonly any[]): number {
 	return Math.ceil(chars / 3.5);
 }
 
+function sanitizeModelJson(text: string): string {
+	// 1. Convert Python triple quotes: content: '''...''' or """..."""
+	let cleaned = text.replace(/:\s*('''|""")([\s\S]*?)\1/g, (_, __, content) => {
+		return ": " + JSON.stringify(content);
+	});
+	// 2. Convert single-quoted JSON keys: 'name': 'write'
+	cleaned = cleaned.replace(/'([a-zA-Z0-9_]+)'\s*:/g, '"$1":');
+	return cleaned;
+}
+
 function extractToolCalls(text: string): ToolCall[] {
+	const sanitized = sanitizeModelJson(text);
 	const toolCalls: ToolCall[] = [];
 	let pos = 0;
-	while (pos < text.length) {
-		const nameIdx = text.indexOf('"name"', pos);
+	while (pos < sanitized.length) {
+		const nameIdx = sanitized.indexOf('"name"', pos);
 		if (nameIdx === -1) break;
-		const openBrace = text.lastIndexOf("{", nameIdx);
+		const openBrace = sanitized.lastIndexOf("{", nameIdx);
 		if (openBrace === -1) {
 			pos = nameIdx + 6;
 			continue;
@@ -97,8 +110,8 @@ function extractToolCalls(text: string): ToolCall[] {
 		let inString = false;
 		let escape = false;
 		let endBrace = -1;
-		for (let i = openBrace; i < text.length; i++) {
-			const ch = text[i];
+		for (let i = openBrace; i < sanitized.length; i++) {
+			const ch = sanitized[i];
 			if (escape) {
 				escape = false;
 				continue;
@@ -124,7 +137,7 @@ function extractToolCalls(text: string): ToolCall[] {
 		}
 
 		if (endBrace !== -1) {
-			const jsonStr = text.slice(openBrace, endBrace + 1);
+			const jsonStr = sanitized.slice(openBrace, endBrace + 1);
 			try {
 				const repaired = repairJson(jsonStr);
 				const obj = JSON.parse(repaired);
@@ -311,6 +324,122 @@ function parseTestOutput(output: string, exitCode: number) {
 	};
 }
 
+function runVerificationTests(testCmd: string, targetRepo: string) {
+	try {
+		const output = execSync(`${testCmd} 2>&1`, { cwd: targetRepo, encoding: "utf-8" });
+		return {
+			command: testCmd,
+			...parseTestOutput(output, 0),
+			output: output.trim(),
+		};
+	} catch (err: any) {
+		const combinedOutput = `${err.stdout || ""}\n${err.stderr || ""}`.trim();
+		return {
+			command: testCmd,
+			...parseTestOutput(combinedOutput, err.status ?? 1),
+			output: combinedOutput,
+		};
+	}
+}
+
+async function predictFootprint(
+	task: TaskDefinition,
+	targetRepo: string,
+	options: CommonOptions,
+): Promise<PredictedFootprint> {
+	let repoFiles: string[] = [];
+	try {
+		const out = execSync("git ls-files", { cwd: targetRepo, encoding: "utf-8" });
+		repoFiles = out.split("\n").map((f) => f.trim()).filter(Boolean);
+	} catch {
+		repoFiles = Object.keys(task.files ?? {});
+	}
+
+	const systemPrompt =
+		"You are an expert autonomous software engineering planner.\n" +
+		"Analyze the workspace files, the problem statement, and the test command.\n" +
+		"Predict the state footprint the agent will need to touch:\n" +
+		"1. `read`: list of file paths the agent will read.\n" +
+		"2. `write`: list of file paths the agent will edit or create.\n" +
+		"3. `execute`: list of commands the agent will run in terminal (e.g. test command).\n" +
+		"4. `reasoning`: brief explanation of the prediction.\n\n" +
+		"Respond ONLY with a JSON object conforming to:\n" +
+		"{\n" +
+		'  "read": ["filename"],\n' +
+		'  "write": ["filename"],\n' +
+		'  "execute": ["command"],\n' +
+		'  "reasoning": "string"\n' +
+		"}";
+
+	const userPrompt =
+		`Workspace Files:\n${repoFiles.map((f) => `- ${f}`).join("\n") || "(empty)"}\n\n` +
+		`Problem Statement:\n${task.problem.trim()}\n\n` +
+		`Test Command:\n${task.testCmd}\n`;
+
+	try {
+		const res = await fetch(`${options.ollamaUrl}/chat/completions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: options.model,
+				messages: [
+					{ role: "system", content: systemPrompt },
+					{ role: "user", content: userPrompt },
+				],
+				temperature: 0.1,
+				stream: false,
+			}),
+		});
+
+		if (!res.ok) {
+			throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+		}
+
+		const data = (await res.json()) as any;
+		const rawContent = data.choices?.[0]?.message?.content ?? "";
+		return parsePredictedFootprint(rawContent, repoFiles, task.testCmd);
+	} catch (err) {
+		console.warn(`Planner prediction fallback due to: ${err instanceof Error ? err.message : String(err)}`);
+		return fallbackPredictedFootprint(repoFiles, task.testCmd);
+	}
+}
+
+function parsePredictedFootprint(raw: string, repoFiles: string[], testCmd: string): PredictedFootprint {
+	try {
+		const cleaned = repairJson(raw);
+		const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+		if (jsonMatch) {
+			const parsed = JSON.parse(jsonMatch[0]);
+			const rawRead = parsed.read ?? parsed.files_to_read ?? parsed.readFiles ?? parsed.reads;
+			const rawWrite = parsed.write ?? parsed.files_to_write ?? parsed.writeFiles ?? parsed.writes;
+			const rawExec = parsed.execute ?? parsed.commands_to_execute ?? parsed.executeCommands ?? parsed.commands;
+
+			const read = Array.isArray(rawRead) ? rawRead.map(String) : [];
+			const write = Array.isArray(rawWrite) ? rawWrite.map(String) : [];
+			const execute = Array.isArray(rawExec) ? rawExec.map(String) : [];
+
+			return {
+				read: Array.from(new Set(read)),
+				write: Array.from(new Set(write)),
+				execute: Array.from(new Set(execute)),
+				reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : undefined,
+			};
+		}
+	} catch {}
+
+	return fallbackPredictedFootprint(repoFiles, testCmd);
+}
+
+function fallbackPredictedFootprint(repoFiles: string[], testCmd: string): PredictedFootprint {
+	const nonTestFiles = repoFiles.filter((f) => !f.startsWith("test_") && !f.includes(".test."));
+	return {
+		read: repoFiles,
+		write: nonTestFiles.length > 0 ? nonTestFiles : repoFiles,
+		execute: [testCmd],
+		reasoning: "Fallback heuristic footprint prediction based on workspace files.",
+	};
+}
+
 interface CommonOptions {
 	model: string;
 	ollamaUrl: string;
@@ -342,6 +471,7 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 		execSync("git init -q", { cwd: targetRepo });
 		execSync('git config user.name "SWE Tester"', { cwd: targetRepo });
 		execSync('git config user.email "swe@test.local"', { cwd: targetRepo });
+		await writeFile(resolve(targetRepo, ".gitignore"), `${options.dbName}\n${options.dbName}-*\n`, "utf-8");
 		for (const [filename, content] of Object.entries(task.files)) {
 			await writeFile(resolve(targetRepo, filename), content, "utf-8");
 		}
@@ -364,7 +494,18 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 		console.log(`>> Baseline test failed as expected.`);
 	}
 
-	// 3. Configure local Ollama model provider with tool adapter
+	// 3. Planner Predicted Footprint
+	console.log(`\n--- Planner Formulating Predicted Footprint ---`);
+	const predictedFootprint = await predictFootprint(task, targetRepo, options);
+	console.log(`Predicted Read Set:    ${predictedFootprint.read.join(", ") || "(none)"}`);
+	console.log(`Predicted Write Set:   ${predictedFootprint.write.join(", ") || "(none)"}`);
+	console.log(`Predicted Execute Set: ${predictedFootprint.execute.join(", ") || "(none)"}`);
+	if (predictedFootprint.reasoning) {
+		console.log(`Reasoning:             ${predictedFootprint.reasoning}`);
+	}
+	console.log(`-----------------------------------------------\n`);
+
+	// 4. Configure local Ollama model provider with tool adapter
 	const baseApi = openAICompletionsApi();
 	const ollama = createProvider<"openai-completions">({
 		id: "ollama",
@@ -414,10 +555,10 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 						"- Wait for the tool result before taking the next action.\n" +
 						"Workflow:\n" +
 						"1. Call `read` on the target source file to inspect its exact code and signatures.\n" +
-						"2. Fix the bug by calling `write` or `edit` with the correct implementation.\n" +
+						"2. Fix the bug by calling `write` or `edit` with the correct implementation. (If `edit` fails to match exact whitespace, call `write` to overwrite the target file with the complete corrected code).\n" +
 						"3. Use `bash` to run unit tests and verify the fix works.\n" +
-						"4. If any test fails, analyze the test error, apply another `edit` or `write` to fix it, and re-run unit tests.\n" +
-						"5. Once all tests pass, provide a concise final summary without calling any more tools.",
+						"4. If any test fails, analyze the test error, apply another `write` or `edit` to fix it, and re-run unit tests.\n" +
+						"5. Do NOT stop until all unit tests pass. Once all tests pass, provide a concise final summary without calling any more tools.",
 					{ tag: false },
 				),
 			],
@@ -468,26 +609,120 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 	console.log(task.problem.trim());
 	console.log("------------------------------------\n");
 
-	const submission = await root.submit({ type: "input", content: task.problem }, context);
-	const settled = await submission.wait(context);
+	const maxAttempts = 5;
+	const maxStallAttempts = 2;
+	let currentPrompt = task.problem;
+	let attempt = 0;
+	let bestPassedTests = -1;
+	let stallCount = 0;
+	let isSatisfied = false;
+	let fallbackTriggered = false;
+	let lastSettledStatus = "unknown";
+	const iterationHistory: Array<{
+		attempt: number;
+		testsPassed: number;
+		testsTotal: number;
+		testStatus: string;
+		status: string;
+		diffPresent: boolean;
+	}> = [];
+
+	while (attempt < maxAttempts && !isSatisfied) {
+		attempt++;
+		if (attempt > 1) {
+			console.log(`\n==========================================================`);
+			console.log(` Dynamic Adaptive Attempt ${attempt}/${maxAttempts}`);
+			console.log(`==========================================================`);
+		}
+
+		const submission = await root.submit({ type: "input", content: currentPrompt }, context);
+		const settled = await submission.wait(context);
+		lastSettledStatus = settled.status;
+
+		if (settled.status === "done" && settled.type === "input") {
+			const answer = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
+			const msg = answer?.model?.[0];
+			if (msg && msg.role === "assistant") {
+				const text = msg.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+				if (text && text !== printed) {
+					console.log("\nResponse:\n", text);
+				}
+			}
+		} else if (settled.status === "unanswered") {
+			console.error("Unanswered reason:", settled.reason, settled.detail);
+		}
+
+		// Run verification tests
+		const currentTestResult = runVerificationTests(task.testCmd, targetRepo);
+		console.log(
+			`\n[Attempt ${attempt} Result] Tests: ${currentTestResult.passed}/${currentTestResult.total} passed (Status: ${currentTestResult.status})`,
+		);
+
+		let currentDiff = "";
+		try {
+			currentDiff = execSync("git diff", { cwd: targetRepo, encoding: "utf-8" }).trim();
+		} catch {}
+
+		iterationHistory.push({
+			attempt,
+			testsPassed: currentTestResult.passed,
+			testsTotal: currentTestResult.total,
+			testStatus: currentTestResult.status,
+			status: settled.status,
+			diffPresent: currentDiff.length > 0,
+		});
+
+		if (currentTestResult.status === "passed") {
+			console.log(`\n>> All verification tests passed! Dynamic transaction committed.`);
+			isSatisfied = true;
+			break;
+		}
+
+		// Check progress
+		if (currentTestResult.passed > bestPassedTests) {
+			console.log(
+				`>> Progress detected: tests passed improved from ${bestPassedTests === -1 ? 0 : bestPassedTests} to ${currentTestResult.passed}/${currentTestResult.total}.`,
+			);
+			bestPassedTests = currentTestResult.passed;
+			stallCount = 0;
+		} else {
+			stallCount++;
+			console.log(`>> No improvement (stall count: ${stallCount}/${maxStallAttempts}).`);
+		}
+
+		if (stallCount >= maxStallAttempts) {
+			console.warn(`>> Stagnation detected: agent made no progress in ${stallCount} consecutive attempts. Triggering fallback.`);
+			fallbackTriggered = true;
+			// Revert workspace to clean baseline
+			try {
+				execSync(`git checkout . && git clean -fd -e "${options.dbName}*"`, { cwd: targetRepo, stdio: "pipe" });
+				console.log(`>> Fallback: Reverted workspace to baseline clean state.`);
+			} catch {}
+			break;
+		}
+
+		if (attempt < maxAttempts) {
+			if (currentDiff.length === 0) {
+				currentPrompt =
+					"No modifications have been made to the repository yet, or your previous edit failed to match. " +
+					"Please inspect the target source file and call `write` with the complete corrected file contents, " +
+					`then run '${task.testCmd}' using bash to verify all tests pass.`;
+			} else {
+				currentPrompt =
+					`Unit tests did not pass (${currentTestResult.passed}/${currentTestResult.total} passed).\n` +
+					`Test output:\n${currentTestResult.output}\n\n` +
+					"Please analyze the exact failure above, apply another fix using `write` or `edit`, " +
+					`and run '${task.testCmd}' using bash to verify.`;
+			}
+			console.log(`\n--- Feeding Adaptive Follow-Up to Agent ---`);
+			console.log(currentPrompt.slice(0, 200) + "...\n");
+		}
+	}
 
 	if (liveWatch) await liveWatch.stop();
 
 	console.log("\n--- Task Settled ---");
-	console.log("Status:", settled.status);
-
-	if (settled.status === "done" && settled.type === "input") {
-		const answer = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
-		const msg = answer?.model?.[0];
-		if (msg && msg.role === "assistant") {
-			const text = msg.content.map((c) => (c.type === "text" ? c.text : "")).join("");
-			if (text && text !== printed) {
-				console.log("Final response:\n", text);
-			}
-		}
-	} else if (settled.status === "unanswered") {
-		console.error("Unanswered reason:", settled.reason, settled.detail);
-	}
+	console.log("Status:", isSatisfied ? "passed" : fallbackTriggered ? "stalled_fallback" : lastSettledStatus);
 
 	const entries = await root.entries({}, 50, undefined, context);
 	console.log("\n--- Execution History ---");
@@ -517,46 +752,64 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 	await harness.close(context);
 	const footprint = footprintTracker ? footprintTracker.finalize() : null;
 
-	// 4. Test verification
-	let testResult = {
-		command: task.testCmd,
-		total: 0,
-		passed: 0,
-		failed: 0,
-		failures: 0,
-		errors: 0,
-		status: "unknown",
-		output: "",
-	};
+	const footprintComparison = footprint
+		? FootprintTracker.compareFootprints(predictedFootprint, footprint, targetRepo)
+		: undefined;
 
-	try {
-		const output = execSync(`${task.testCmd} 2>&1`, { cwd: targetRepo, encoding: "utf-8" });
-		testResult = {
-			command: task.testCmd,
-			...parseTestOutput(output, 0),
-			output: output.trim(),
-		};
-	} catch (err: any) {
-		const combinedOutput = `${err.stdout || ""}\n${err.stderr || ""}`.trim();
-		testResult = {
-			command: task.testCmd,
-			...parseTestOutput(combinedOutput, err.status ?? 1),
-			output: combinedOutput,
-		};
+	if (footprintComparison) {
+		console.log(`\n==========================================================`);
+		console.log(` Footprint Comparison (Planner Prediction vs Actual Execution)`);
+		console.log(`==========================================================`);
+		console.log(
+			`Reads:    Precision: ${(footprintComparison.read.precision * 100).toFixed(0)}%, Recall: ${(footprintComparison.read.recall * 100).toFixed(0)}%`,
+		);
+		console.log(`          Predicted: [${footprintComparison.read.predicted.join(", ") || "(none)"}]`);
+		console.log(`          Actual:    [${footprintComparison.read.actual.join(", ") || "(none)"}]`);
+		console.log(`          Matched:   [${footprintComparison.read.truePositives.join(", ") || "(none)"}]`);
+		if (footprintComparison.read.falsePositives.length > 0) {
+			console.log(`          Predicted but unread: [${footprintComparison.read.falsePositives.join(", ")}]`);
+		}
+		if (footprintComparison.read.falseNegatives.length > 0) {
+			console.log(`          Unpredicted reads:    [${footprintComparison.read.falseNegatives.join(", ")}]`);
+		}
+
+		console.log(
+			`Writes:   Precision: ${(footprintComparison.write.precision * 100).toFixed(0)}%, Recall: ${(footprintComparison.write.recall * 100).toFixed(0)}%`,
+		);
+		console.log(`          Predicted: [${footprintComparison.write.predicted.join(", ") || "(none)"}]`);
+		console.log(`          Actual:    [${footprintComparison.write.actual.join(", ") || "(none)"}]`);
+		console.log(`          Matched:   [${footprintComparison.write.truePositives.join(", ") || "(none)"}]`);
+		if (footprintComparison.write.falsePositives.length > 0) {
+			console.log(`          Predicted but unwritten: [${footprintComparison.write.falsePositives.join(", ")}]`);
+		}
+		if (footprintComparison.write.falseNegatives.length > 0) {
+			console.log(`          Unpredicted writes:      [${footprintComparison.write.falseNegatives.join(", ")}]`);
+		}
+
+		console.log(
+			`Executes: Precision: ${(footprintComparison.execute.precision * 100).toFixed(0)}%, Recall: ${(footprintComparison.execute.recall * 100).toFixed(0)}%`,
+		);
+		console.log(`          Predicted: [${footprintComparison.execute.predicted.join(", ") || "(none)"}]`);
+		console.log(`          Actual:    [${footprintComparison.execute.actual.join(", ") || "(none)"}]`);
+		console.log(`          Matched:   [${footprintComparison.execute.truePositives.join(", ") || "(none)"}]`);
+
+		console.log(
+			`Summary:  Exact Match: ${footprintComparison.summary.exactMatch ? "YES" : "NO"} | Overall F1: ${(footprintComparison.summary.overallF1 * 100).toFixed(0)}% (Precision: ${(footprintComparison.summary.overallPrecision * 100).toFixed(0)}%, Recall: ${(footprintComparison.summary.overallRecall * 100).toFixed(0)}%)`,
+		);
+		console.log(`==========================================================\n`);
 	}
 
+	// 4. Test verification
+	const testResult = runVerificationTests(task.testCmd, targetRepo);
+
 	// 5. Extract plan graph and token breakdown from SQLite
-	const db = new DatabaseSync(dbPath, { readOnly: true });
-	const rawTasks = db.prepare("SELECT id, kind, status, record FROM tasks ORDER BY id ASC").all() as Array<{
-		id: number;
-		kind: string;
-		status: string;
-		record: string;
-	}>;
-	const rawEntries = db.prepare("SELECT id, record FROM entries ORDER BY id ASC").all() as Array<{
-		id: number;
-		record: string;
-	}>;
+	let rawTasks: Array<{ id: number; kind: string; status: string; record: string }> = [];
+	let rawEntries: Array<{ id: number; record: string }> = [];
+	if (existsSync(dbPath)) {
+		const db = new DatabaseSync(dbPath, { readOnly: true });
+		rawTasks = db.prepare("SELECT id, kind, status, record FROM tasks ORDER BY id ASC").all() as any;
+		rawEntries = db.prepare("SELECT id, record FROM entries ORDER BY id ASC").all() as any;
+	}
 
 	const entriesMap = new Map<number, any>();
 	for (const e of rawEntries) {
@@ -715,7 +968,14 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 		task: {
 			workspace: targetRepo,
 			problemStatement: task.problem.trim(),
-			status: settled.status,
+			status: isSatisfied ? "passed" : fallbackTriggered ? "stalled_fallback" : lastSettledStatus,
+		},
+		adaptiveLoop: {
+			totalAttempts: attempt,
+			maxAttempts,
+			isSatisfied,
+			fallbackTriggered,
+			iterations: iterationHistory,
 		},
 		tokens: tokenTotals,
 		tests: testResult,
@@ -723,6 +983,8 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 			summary: `Executed ${subtasks.length} subtasks (${subtasks.filter((s) => s.kind === "generation").length} generations, ${subtasks.filter((s) => s.kind === "tool").length} tool calls)`,
 			subtasks,
 		},
+		predictedFootprint,
+		footprintComparison: footprintComparison ?? null,
 		footprint: footprint ?? null,
 		gitDiff: diffPatch.trim(),
 	};
@@ -737,6 +999,11 @@ async function runTask(task: TaskDefinition, options: CommonOptions) {
 	console.log(`Tokens Total:   ${taskResult.tokens.total} (Input: ${taskResult.tokens.input}, Output: ${taskResult.tokens.output}, CacheRead: ${taskResult.tokens.cacheRead})`);
 	console.log(`Tests:          ${taskResult.tests.passed}/${taskResult.tests.total} passed (Status: ${taskResult.tests.status})`);
 	console.log(`Plan Subtasks:  ${taskResult.plan.subtasks.length}`);
+	if (footprintComparison) {
+		console.log(
+			`Prediction:     Overall F1: ${(footprintComparison.summary.overallF1 * 100).toFixed(0)}% (Read Recall: ${(footprintComparison.read.recall * 100).toFixed(0)}%, Write Recall: ${(footprintComparison.write.recall * 100).toFixed(0)}%, Exact Match: ${footprintComparison.summary.exactMatch})`,
+		);
+	}
 	if (footprint) {
 		console.log(`Footprint:      Read Set:  ${footprint.summary.totalReads} resources (${footprint.summary.uniqueResourcesRead.join(", ")})`);
 		console.log(`                Write Set: ${footprint.summary.totalWrites} resources (${footprint.summary.uniqueResourcesWritten.join(", ")})`);
@@ -898,6 +1165,14 @@ if (values.config) {
 				testsTotal: r.tests.total,
 				duration: r.duration.formatted,
 				tokens: r.tokens.total,
+				predictionAccuracy: r.footprintComparison
+					? {
+							f1: r.footprintComparison.summary.overallF1,
+							precision: r.footprintComparison.summary.overallPrecision,
+							recall: r.footprintComparison.summary.overallRecall,
+							exactMatch: r.footprintComparison.summary.exactMatch,
+						}
+					: null,
 				footprintSummary: r.footprint?.summary ?? null,
 				resultsFile: r.resultsFilename,
 			})),
